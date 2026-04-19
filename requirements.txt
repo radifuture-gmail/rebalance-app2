@@ -1,5 +1,7 @@
 streamlit
-yfinance
 pandas
 numpy
+yfinance
+pandas_datareader
 plotly
+python-dotenv
