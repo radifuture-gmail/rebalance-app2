@@ -1,4 +1,14 @@
 import streamlit as st
+import sys
+import os
+
+# --- パスの追加 (ImportError対策) ---
+# プロジェクトのルートディレクトリを検索パスに追加します
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from utils.helpers import sync_params_to_url
 from src.data_loader import get_etf_data, get_risk_free_rate, calculate_technical_indicators
 from src.rebalance_logic import (

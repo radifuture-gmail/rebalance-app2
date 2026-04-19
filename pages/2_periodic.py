@@ -12,6 +12,15 @@ from src.visualizer import (
     show_logic_summary, show_action_table
 )
 
+# --- URL同期用ヘルパー関数 ---
+def sync_current_state_to_url():
+    """現在の総額設定と各銘柄の株数をURLに保存する"""
+    params = {
+        "capital": st.session_state.get('total_capital', 100000.0),
+        "holdings": st.session_state.get('virtual_holdings', {})
+    }
+    sync_params_to_url(params)
+
 # 1. データ取得
 with st.spinner("最新データを取得中..."):
     tickers = ["BOXX", "GDE", "RSSB", "DBMF"]
