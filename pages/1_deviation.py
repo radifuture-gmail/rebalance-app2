@@ -1,17 +1,29 @@
 import streamlit as st
+from utils.helpers import sync_params_to_url
 from src.data_loader import get_etf_data, get_risk_free_rate, calculate_technical_indicators
-from src.rebalance_logic import calculate_dynamic_ratios, check_rebalance_trigger, calculate_trade_shares
+from src.rebalance_logic import (
+    calculate_dynamic_ratios, 
+    check_rebalance_trigger, 
+    calculate_trade_shares,
+    get_virtual_current_holdings
+)
 from src.visualizer import (
     plot_price_with_ma, show_metrics, plot_ratio_comparison, 
     show_logic_summary, show_rebalance_status, show_action_table
 )
 
-st.set_page_config(page_title="乖離度リバランス判定", layout="wide")
-
 st.title("🔍 乖離度リバランス判定 (Daily Check)")
 
-# 運用ルール表示
 st.info("💡 運用ルール：乖離判定は日次で行うが、リバランス執行は週1回までとする。")
+
+# --- URL同期用ヘルパー関数 ---
+def sync_current_state_to_url():
+    """現在の総額設定と各銘柄の株数をURLに保存する"""
+    params = {
+        "capital": st.session_state.get('total_capital', 100000.0),
+        "holdings": st.session_state.get('virtual_holdings', {})
+    }
+    sync_params_to_url(params)
 
 # 1. データ取得
 with st.spinner("最新市場データを取得中..."):
@@ -24,53 +36,109 @@ if indicators.empty:
     st.error("インジケーターの計算に必要なデータが不足しています。")
     st.stop()
 
-# 2. 市場概況
+# --- 共通ロジック：保有数量をリセット・同期する関数 ---
+total_capital = st.session_state.get('total_capital', 100000.0)
+
+def reset_holdings_callback():
+    """設定金額に基づき、仮想保有数を計算してリセットする"""
+    new_holdings = get_virtual_current_holdings(
+        df_prices, policy_rate, initial_capital=st.session_state.get('total_capital', 100000.0)
+    )
+    st.session_state['virtual_holdings'] = new_holdings
+    st.session_state['last_synced_capital_dev'] = st.session_state.get('total_capital', 100000.0)
+    for t in tickers:
+        st.session_state[f"dev_input_val_{t}"] = float(new_holdings.get(t, 0.0))
+    sync_current_state_to_url()
+
+def on_holding_change(ticker):
+    """手入力で株数が変更された時にセッションとURLを更新する"""
+    st.session_state['virtual_holdings'][ticker] = st.session_state[f"dev_input_val_{ticker}"]
+    sync_current_state_to_url()
+
+def apply_rebalance_callback(new_shares_dict):
+    """リバランス実行後の株数を反映し、URLに保存する"""
+    for t, shares in new_shares_dict.items():
+        st.session_state['virtual_holdings'][t] = shares
+        st.session_state[f"dev_input_val_{t}"] = shares
+    sync_current_state_to_url()
+
+# 2. 初期化判定
+# URLから読み込まれた株数（app.pyでセット済み）がある場合は計算をスキップする
+if not st.session_state.get('virtual_holdings'):
+    if 'last_synced_capital_dev' not in st.session_state:
+        reset_holdings_callback()
+else:
+    # URLから読み込まれた株数がある場合、ウィジェット用Stateに値を同期する
+    for t in tickers:
+        key = f"dev_input_val_{t}"
+        if key not in st.session_state:
+            st.session_state[key] = float(st.session_state['virtual_holdings'].get(t, 0.0))
+    st.session_state['last_synced_capital_dev'] = total_capital
+
+# サイドバーのリセットボタン
+st.sidebar.button(
+    "保有株数を設定金額に合わせてリセット", 
+    key="reset_dev_btn", 
+    on_click=reset_holdings_callback
+)
+
+# 3. 市場概況
 st.header("1. 市場データ・インジケーター")
 show_metrics(policy_rate, indicators)
 plot_price_with_ma(df_prices, tickers)
 
-# 3. 動的ターゲット比率算出
+# 4. 動的ターゲット比率算出
 target_ratios = calculate_dynamic_ratios(indicators, policy_rate)
 
-# 4. 保有状況入力
+# 5. 保有状況入力
 st.header("2. 保有資産状況と乖離判定")
-with st.expander("現在の保有数量を編集", expanded=False):
+st.markdown(f"ポートフォリオ基準総額設定: **${total_capital:,.2f}**")
+
+with st.expander("保有数量を手動で調整", expanded=True):
     col_input = st.columns(len(tickers))
     current_holdings = {}
     for i, t in enumerate(tickers):
-        # 【修正】valueを明示的にfloatに変換し、stepも1.0(float)に統一
-        val = float(st.session_state['virtual_holdings'][t])
+        key = f"dev_input_val_{t}"
         current_holdings[t] = col_input[i].number_input(
             f"{t} 保有数量", 
-            value=val,
             step=1.0,
-            key=f"input_{t}"
+            key=key,
+            on_change=on_holding_change,
+            args=(t,)
         )
-        st.session_state['virtual_holdings'][t] = current_holdings[t]
 
-# 5. リバランス判定
+# 6. リバランス判定
 current_prices = indicators["current_price"].to_dict()
+# 入力された株数に基づく「実際の現在価値」
+actual_current_value = sum(current_holdings[t] * current_prices[t] for t in tickers)
+
 is_required, actual_ratios, deviations = check_rebalance_trigger(
     current_holdings, current_prices, target_ratios
 )
 
 show_rebalance_status(is_required, deviations)
 plot_ratio_comparison(actual_ratios, target_ratios)
+st.metric("現在のポートフォリオ合計時価 (入力株数ベース)", f"${actual_current_value:,.2f}")
 
-# 6. 判断過程
+# 7. 判断過程
 show_logic_summary(indicators, target_ratios, policy_rate)
 
-# 7. アクション
+# 8. アクション
 if is_required:
     st.header("3. 執行プラン")
-    total_value = sum(current_holdings[t] * current_prices[t] for t in tickers)
-    df_actions = calculate_trade_shares(total_value, target_ratios, current_prices, current_holdings)
+    # 【変更】リバランス後の計算基準を「設定総額(total_capital)」に固定
+    df_actions = calculate_trade_shares(total_capital, target_ratios, current_prices, current_holdings)
     show_action_table(df_actions)
     
-    if st.button("リバランスを実行したとして保有数を更新(模擬)"):
-        for t in tickers:
-            target_val = total_value * target_ratios[t]
-            st.session_state['virtual_holdings'][t] = target_val / current_prices[t]
-        st.rerun()
+    # 執行後の新しい株数（total_capitalを基準に計算）
+    new_shares_after_rebalance = {}
+    for t in tickers:
+        new_shares_after_rebalance[t] = float((total_capital * target_ratios[t]) / current_prices[t])
+    
+    st.button(
+        f"リバランスを実行（総額 ${total_capital:,.2f} に調整）", 
+        on_click=apply_rebalance_callback, 
+        args=(new_shares_after_rebalance,)
+    )
 else:
-    st.success("現在のポートフォリオは、動的調整後のターゲット比率に対して許容範囲内です。")
+    st.success("現在のポートフォリオは許容範囲内です。")
