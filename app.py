@@ -3,206 +3,209 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime, timedelta
 
-# --- 設定 ---
+# --- 1. アプリ設定 & スタイル ---
+st.set_page_config(page_title="Portfolio Rebalancer 2026", layout="wide")
+st.markdown("""
+    <style>
+    .reportview-container .main .block-container{ max-width: 1200px; }
+    .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- 2. 定数・要件定義 ---
 TICKERS = ["BOXX", "GDE", "RSSB", "DBMF"]
 DEFAULT_WEIGHTS = {"BOXX": 0.10, "GDE": 0.30, "RSSB": 0.30, "DBMF": 0.30}
 RATE_TICKER = "^IRX"  # 米国13週国債利回り
 
-st.set_page_config(page_title="Strategic Rebalancer 2026", layout="wide")
-
-# カスタムCSSで視認性を向上
-st.markdown("""
-    <style>
-    .metric-card { background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 5px solid #2e77d1; }
-    .status-box { padding: 15px; border-radius: 5px; margin-bottom: 10px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- ヘルパー関数 ---
-def is_business_day(date):
-    return date.weekday() < 5  # 0-4 is Mon-Fri
-
-def get_first_weekday_after_20th(year, month):
-    dt = datetime(year, month, 20)
-    while not is_business_day(dt):
-        dt += timedelta(days=1)
-    return dt.date()
-
-# --- データ取得 ---
+# --- 3. データ取得エンジン (エラー回避/堅牢性) ---
 @st.cache_data(ttl=3600)
 def fetch_data():
-    all_symbols = TICKERS + [RATE_TICKER]
-    # MA200日＋余裕を持って1.5年分
-    data = yf.download(all_symbols, period="2y", interval="1d")
-    prices = data['Adj Close'].ffill()
-    return prices
+    try:
+        # MA200日のために十分な期間を取得
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=450)
+        
+        data = yf.download(TICKERS + [RATE_TICKER], start=start_date, end=end_date, interval="1d")
+        
+        if data.empty:
+            return None, None
+        
+        # マルチインデックス対策
+        prices = data['Adj Close'].ffill().dropna()
+        # 政策金利の取得 (直近値)
+        latest_rate = data['Adj Close'][RATE_TICKER].ffill().iloc[-1] / 100
+        
+        return prices[TICKERS], latest_rate
+    except Exception as e:
+        st.error(f"データ取得エラー: {e}")
+        return None, None
 
-# --- メインロジック ---
-def calculate_dynamic_logic(prices, policy_rate):
-    # 1. 指標計算
-    # 1ヶ月トータルリターン年換算 (21営業日)
-    ret_1m = (prices.iloc[-1] / prices.iloc[-21] - 1) * 12
-    # 移動平均
-    ma1m = prices.rolling(window=21).mean().iloc[-1]
-    ma3m = prices.rolling(window=63).mean().iloc[-1]
-    ma200d = prices.rolling(window=200).mean().iloc[-1]
+def is_us_business_day(date):
+    """土日を除外した簡易営業日判定"""
+    return date.weekday() < 5
+
+def get_target_rebalance_day(date):
+    """毎月20日以降の最初の平日を計算"""
+    target = date.replace(day=20)
+    while not is_us_business_day(target):
+        target += timedelta(days=1)
+    return target.date()
+
+# --- 4. ロジック計算エンジン ---
+def calculate_logic(prices, policy_rate):
+    last_price = prices.iloc[-1]
     
-    # 2. BOXX比率の決定
-    other_etfs = ["GDE", "RSSB", "DBMF"]
-    max_other_ret = max(ret_1m[other_etfs].max(), 0.03)
-    diff = policy_rate - max_other_ret
+    # A. 1ヶ月トータルリターン (年換算)
+    # 21営業日前との比較
+    ret_1m = (prices.iloc[-1] / prices.iloc[-21]) - 1
+    ret_1m_ann = ret_1m * 12  # 簡易年換算
     
-    boxx_boost = max(0, diff * 3)
-    target_boxx = min(0.10 + boxx_boost, 0.40)
+    # B. BOXXブースト判定
+    max_other_ret = ret_1m_ann.drop("BOXX").max()
+    diff_rate = policy_rate - max(max_other_ret, 0.03)
+    boxx_boost = max(0, diff_rate * 3)
+    target_boxx = min(0.1 + boxx_boost, 0.4)
     
-    # 基本比率の構築
-    rem_w = (1.0 - target_boxx) / 3
-    weights = {t: (target_boxx if t == "BOXX" else rem_w) for t in TICKERS}
+    # C. 移動平均 (1m=21d, 3m=63d, 200d)
+    ma1m = prices.rolling(21).mean().iloc[-1]
+    ma3m = prices.rolling(63).mean().iloc[-1]
+    ma200d = prices.rolling(200).mean().iloc[-1]
     
-    # 3. MA乖離による動的調整
-    adjustment_logs = []
+    # D. 配分調整
+    weights = {t: (1.0 - target_boxx) / 3 for t in TICKERS if t != "BOXX"}
+    weights["BOXX"] = target_boxx
+    
     reduction_pool = 0
+    details = []
     
-    # 各銘柄の「マシ」度合い判定（加算先決定用）
-    relative_perf = (ma3m / ma200d) - 1
-    best_ticker = relative_perf.idxmax()
-
-    for t in other_etfs:
+    for t in ["GDE", "RSSB", "DBMF"]:
         under_pct = (ma200d[t] - ma3m[t]) / ma200d[t]
-        # 条件: 3%以上下回る かつ 1mMAが3mMAを下回っている（回復していない）
-        if under_pct > 0.03 and ma1m[t] < ma3m[t]:
+        is_recovery = ma1m[t] >= ma3m[t]
+        
+        status = "Default"
+        if under_pct >= 0.03 and not is_recovery:
             reduction = weights[t] * under_pct
             weights[t] -= reduction
             reduction_pool += reduction
-            adjustment_logs.append(f"⚠️ {t}: MA乖離 {under_pct:.1%} 低迷により比率削減")
-        elif ma1m[t] >= ma3m[t] and t != "BOXX":
-            adjustment_logs.append(f"✅ {t}: 回復基調(1mMA > 3mMA)のためデフォルト維持")
+            status = f"Reduced (-{under_pct:.1%})"
+        elif is_recovery:
+            status = "Recovery (Protected)"
+            
+        details.append({"Ticker": t, "MA3m/MA200d": 1-under_pct, "Status": status})
 
+    # 減算分を一番マシなETFへ加算
+    perf_ratio = ma3m / ma200d
+    best_ticker = perf_ratio.idxmax()
     weights[best_ticker] += reduction_pool
-    if reduction_pool > 0:
-        adjustment_logs.append(f"ℹ️ 削減分 {reduction_pool:.1%} を最も好調な {best_ticker} へ配分")
-
-    return weights, ret_1m, ma1m, ma3m, ma200d, adjustment_logs, target_boxx
-
-# --- UIレイアウト ---
-st.title("🦅 Advanced Dynamic Rebalancer")
-st.markdown(f"**分析実行日:** {datetime.now().strftime('%Y-%m-%d')}")
-
-try:
-    price_df = fetch_data()
-    latest_prices = price_df[TICKERS].iloc[-1]
-    raw_rate = yf.Ticker(RATE_TICKER).fast_info['last_price'] / 100
-except:
-    st.error("データの取得に失敗しました。")
-    st.stop()
-
-# サイドバー
-with st.sidebar:
-    st.header("⚙️ システム設定")
-    user_rate = st.number_input("政策金利プロキシ (%)", value=raw_rate*100, step=0.1) / 100
-    total_capital = st.number_input("運用総額 ($)", value=100000, step=1000)
     
-    st.divider()
-    st.subheader("現在の保有株数")
-    holdings = {t: st.number_input(f"{t}", value=100) for t in TICKERS}
+    return weights, details, ret_1m_ann, ma3m, ma200d, ma1m
+
+# --- 5. メイン UI ---
+prices, auto_rate = fetch_data()
+
+if prices is not None:
+    st.title("⚖️ Strategic Portfolio Rebalancer")
     
-    st.divider()
-    last_reb_date = st.date_input("前回リバランス日", datetime.now() - timedelta(days=10))
+    # サイドバー: ユーザー入力
+    with st.sidebar:
+        st.header("Settings")
+        user_rate = st.number_input("Policy Rate (%)", value=float(auto_rate*100), step=0.1) / 100
+        total_cash = st.number_input("Total Assets ($)", value=100000)
+        st.divider()
+        st.write("Current Holdings (Shares)")
+        shares = {t: st.number_input(f"{t}", value=100) for t in TICKERS}
+        last_rebal_date = st.date_input("Last Rebalance Date", datetime.now() - timedelta(days=10))
 
-# 計算実行
-final_w, ret1m, m1, m3, m200, logs, b_target = calculate_dynamic_logic(price_df, user_rate)
-
-# --- 1. 判定データの網羅的表示 ---
-st.header("1. 判定基盤データの解析")
-col_stats = st.columns(4)
-for i, t in enumerate(TICKERS):
-    with col_stats[i]:
-        st.markdown(f"**{t}**")
-        st.write(f"価格: ${latest_prices[t]:.2f}")
-        st.write(f"1mリターン: {ret1m[t]:.1%}")
-        st.caption(f"3mMA: {m3[t]:.1f} / 200dMA: {m200[t]:.1f}")
-
-# --- 2. 判断プロセスの可視化 ---
-st.header("2. リバランス判断プロセス")
-proc_col1, proc_col2 = st.columns(2)
-
-with proc_col1:
-    st.subheader("Step A: BOXX比率の決定")
-    boxx_diff = user_rate - max(ret1m.drop("BOXX").max(), 0.03)
-    st.code(f"政策金利({user_rate:.1%}) - Max(他リターン, 3%) = 乖離({boxx_diff:.1%})")
-    st.write(f"結果: BOXX目標比率 **{b_target:.1%}** (Base 10% + 加算)")
+    # 計算実行
+    target_weights, logic_details, ret_ann, m3, m200, m1 = calculate_logic(prices, user_rate)
     
-    fig_ma = go.Figure()
-    for t in ["GDE", "RSSB", "DBMF"]:
-        gap = (m3[t]/m200[t] - 1) * 100
-        fig_ma.add_trace(go.Bar(x=[t], y=[gap], name=t, marker_color='red' if gap < -3 else 'blue'))
-    fig_ma.update_layout(title="MA乖離率 (%) [3m / 200d]", yc軸_title="%", height=300)
-    st.plotly_chart(fig_ma, use_container_width=True)
+    # --- 要件1: 判定データの可視化 ---
+    st.header("1. Market Data & Signals")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Policy Rate", f"{user_rate:.2%}")
+    col2.metric("Max ETF Return (1m)", f"{ret_ann.drop('BOXX').max():.2%}")
+    col3.metric("BOXX Target Weight", f"{target_weights['BOXX']:.1%}")
 
-with proc_col2:
-    st.subheader("Step B: 動的配分調整")
-    if not logs:
-        st.write("調整なし: 全銘柄が基準内です。")
-    for log in logs:
-        st.write(log)
+    # 移動平均の比較図
+    df_ma = pd.DataFrame({"1m MA": m1, "3m MA": m3, "200d MA": m200})
+    st.bar_chart(df_ma)
 
-# --- 3. リバランス要否の判定 ---
-st.header("3. リバランス実行判定")
-today = datetime.now().date()
-is_periodic = today >= get_first_weekday_after_20th(today.year, today.month) and today.month % 3 == 0
-days_since_last = (today - last_reb_date).days
-is_weekly_limit = days_since_last < 7
+    # --- 要件2: 判断過程の可視化 ---
+    st.header("2. Logic Judgment Process")
+    
+    # BOXX判定
+    with st.expander("BOXX Boost Logic Details", expanded=True):
+        st.write(f"Formula: `{user_rate:.2%} - max({ret_ann.drop('BOXX').max():.2%}, 3.00%) = {user_rate - max(ret_ann.drop('BOXX').max(), 0.03):.4%}`")
+        if (user_rate - max(ret_ann.drop('BOXX').max(), 0.03)) > 0:
+            st.success("BOXX Boost Applied")
+        else:
+            st.info("No BOXX Boost (Below threshold)")
 
-# 乖離判定 (現在の評価額ベースの比率 vs 目標比率)
-current_values = {t: holdings[t] * latest_prices[t] for t in TICKERS}
-actual_total = sum(current_values.values())
-current_weights = {t: current_values[t]/actual_total for t in TICKERS}
-drift_trigger = any(abs(current_weights[t] - final_w[t]) > 0.05 for t in TICKERS) # 5%以上の乖離をσ2のプロキシとして設定
+    # 動的配分詳細
+    st.table(pd.DataFrame(logic_details))
 
-rebalance_needed = (is_periodic or drift_trigger) and not is_weekly_limit
+    # --- 要件3: リバランス要否の可視化 ---
+    st.header("3. Execution Decision")
+    
+    today = datetime.now().date()
+    target_date = get_target_rebalance_day(today)
+    is_periodic = today >= target_date
+    
+    # 乖離度判定 (σ2相当として現在比率と目標比率の合計乖離を利用)
+    current_vals = {t: shares[t] * prices[t].iloc[-1] for t in TICKERS}
+    curr_total = sum(current_vals.values())
+    curr_weights = {t: v / curr_total for t, v in current_vals.items()}
+    drift = sum([abs(curr_weights[t] - target_weights[t]) for t in TICKERS])
+    is_drifted = drift > 0.05 # 5%以上の乖離をトリガーとする例
+    
+    # 週1制限
+    is_week_passed = (today - last_rebal_date).days >= 7
 
-c_status1, c_status2, c_status3 = st.columns(3)
-with c_status1:
-    st.metric("定期リバランス期", "Yes" if is_periodic else "No")
-with c_status2:
-    st.metric("乖離(Drift)検知", "⚠️ 発生中" if drift_trigger else "正常")
-with c_status3:
-    st.metric("実行制限(週1回)", "OK" if not is_weekly_limit else "待機中", delta=f"{days_since_last}日経過")
+    rebal_needed = (is_periodic or is_drifted) and is_week_passed
 
-if rebalance_needed:
-    st.error("🚨 【判定】リバランス実行を推奨します")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.info(f"Monthly Target: {target_date}")
+    c2.write(f"Drift Level: {drift:.1%}")
+    c3.write(f"Week Limit: {'OK' if is_week_passed else 'Wait'}")
+    
+    if rebal_needed:
+        st.error("🚨 REBALANCE REQUIRED")
+        if is_periodic: st.write("- Reason: Regular monthly schedule reached.")
+        if is_drifted: st.write("- Reason: Portfolio drift exceeded threshold.")
+    else:
+        st.success("✅ NO ACTION REQUIRED")
+        if not is_week_passed: st.warning("Execution locked (Last rebalance was within 7 days).")
+
+    # --- 要件4: 売買株式数の可視化 ---
+    st.header("4. Trading Instructions")
+    
+    trade_data = []
+    for t in TICKERS:
+        target_val = total_cash * target_weights[t]
+        diff_val = target_val - current_vals[t]
+        shares_to_trade = diff_val / prices[t].iloc[-1]
+        
+        trade_data.append({
+            "Ticker": t,
+            "Current %": f"{curr_weights[t]:.1%}",
+            "Target %": f"{target_weights[t]:.1%}",
+            "Action": "BUY" if shares_to_trade > 0 else "SELL",
+            "Shares": abs(int(shares_to_trade)),
+            "Est. Value ($)": round(diff_val, 2)
+        })
+
+    st.dataframe(pd.DataFrame(trade_data), use_container_width=True)
+    
+    # Before/After Chart
+    fig = go.Figure(data=[
+        go.Bar(name='Current', x=TICKERS, y=[curr_weights[t] for t in TICKERS]),
+        go.Bar(name='Target', x=TICKERS, y=[target_weights[t] for t in TICKERS])
+    ])
+    fig.update_layout(barmode='group', title="Weight Comparison")
+    st.plotly_chart(fig)
+
 else:
-    st.success("✅ 【判定】現在は維持（No Action）で問題ありません")
-
-# --- 4. 売買指図の可視化 ---
-st.header("4. リバランス実行指図")
-trade_data = []
-for t in TICKERS:
-    target_val = total_capital * final_w[t]
-    current_val = current_values[t]
-    diff_val = target_val - current_val
-    diff_qty = diff_val / latest_prices[t]
-    
-    trade_data.append({
-        "銘柄": t,
-        "現在比率": f"{current_weights[t]:.1%}",
-        "目標比率": f"{final_w[t]:.1%}",
-        "差分額 ($)": f"{diff_val:+,.2f}",
-        "アクション": "BUY" if diff_qty > 0 else "SELL",
-        "株数": abs(int(diff_qty))
-    })
-
-df_trade = pd.DataFrame(trade_data)
-st.table(df_trade)
-
-# ポートフォリオ比較
-fig_compare = go.Figure(data=[
-    go.Bar(name='Current', x=TICKERS, y=[current_weights[t] for t in TICKERS]),
-    go.Bar(name='Target', x=TICKERS, y=[final_w[t] for t in TICKERS])
-])
-fig_compare.update_layout(barmode='group', title="ポートフォリオ構成比較", height=400)
-st.plotly_chart(fig_compare, use_container_width=True)
-
-st.caption("※判定ロジック：3ヶ月移動平均が200日移動平均を3%以上下回った場合、その乖離分を比率から減算し、最もパフォーマンスが良い銘柄へ加算。ただし1ヶ月MAが3ヶ月MA以上なら回復とみなし減算を免除。")
+    st.error("データの取得に失敗しました。週末や市場休場日の直後の場合、データが未更新の可能性があります。")
