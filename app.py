@@ -4,6 +4,35 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import pandas_datareader.data as web
+from datetime import datetime, timedelta
+
+# --- 政策金利の自動取得関数 ---
+@st.cache_data(ttl=86400) # 1日キャッシュしてAPI負荷を軽減
+def get_current_policy_rate():
+    try:
+        # FREDから実効フェデラル・ファンド金利(DFF)を取得
+        end = datetime.now()
+        start = end - timedelta(days=7)
+        df = web.DataReader('DFF', 'fred', start, end)
+        # 最新の値をパーセントから小数に変換 (e.g. 3.64 -> 0.0364)
+        return float(df.iloc[-1].iloc[0]) / 100
+    except Exception as e:
+        # 取得失敗時のフォールバック（2026年4月時点の目安）
+        return 0.0364
+
+# --- サイドバーでの呼び出し部分を書き換え ---
+auto_rate = get_current_policy_rate()
+
+with st.sidebar:
+    st.header("入力パラメータ")
+    # デフォルト値に自動取得した値をセット。微調整も可能。
+    policy_rate = st.number_input(
+        "現在の政策金利 (%)", 
+        value=float(auto_rate * 100), 
+        format="%.2f", 
+        step=0.01
+    ) / 100
 
 # --- 設定 ---
 TICKERS = ["GDE", "DBMF", "RSSB", "BOXX"]
