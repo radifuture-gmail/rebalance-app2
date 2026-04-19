@@ -27,8 +27,30 @@ with st.sidebar:
 @st.cache_data(ttl=3600)
 def get_market_data(tickers):
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=365) # 200日移動平均計算用
-    data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+    start_date = end_date - timedelta(days=365)
+    
+    # データをダウンロード
+    df = yf.download(tickers, start=start_date, end=end_date)
+    
+    if df.empty:
+        st.error("データの取得に失敗しました。ティッカーシンボルが正しいか、またはネットワーク接続を確認してください。")
+        st.stop()
+
+    # 'Adj Close' があれば使い、なければ 'Close' を使う
+    if 'Adj Close' in df.columns.levels[0]:
+        data = df['Adj Close']
+    elif 'Close' in df.columns.levels[0]:
+        data = df['Close']
+    else:
+        # MultiIndexでない場合の対応（1銘柄のみの場合など）
+        if 'Adj Close' in df.columns:
+            data = df[['Adj Close']]
+        else:
+            data = df[['Close']]
+            
+    # 欠損値を前の値で埋める（休日などのズレ対策）
+    data = data.ffill().dropna()
+    
     return data
 
 data = get_market_data(TICKERS)
