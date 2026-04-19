@@ -2,6 +2,6 @@ streamlit
 pandas
 numpy
 yfinance
-pandas_datareader
 plotly
-python-dotenv
+matplotlib
+holidays

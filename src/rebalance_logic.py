@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
 
-# 基準構成比率の定義 [cite: 1, 7]
-DEFAULT_RATIOS = {
+# 基準構成比率
+BASE_RATIOS = {
     "BOXX": 0.10,
     "GDE": 0.30,
     "RSSB": 0.30,
@@ -11,75 +11,97 @@ DEFAULT_RATIOS = {
 
 def calculate_dynamic_ratios(indicators, policy_rate):
     """
-    動的調整ロジックを適用して各ETFの目標構成比率を算出する [cite: 7]
+    動的調整ロジックを適用して各ETFの目標構成比率を算出する。
+    1. BOXX調整 (政策金利ベース)
+    2. その他ETF調整 (MAベース)
     """
-    ratios = DEFAULT_RATIOS.copy()
-    tickers = ["GDE", "RSSB", "DBMF"]
+    if indicators.empty:
+        return BASE_RATIOS.copy()
+        
+    ratios = BASE_RATIOS.copy()
+    non_boxx_tickers = ["GDE", "RSSB", "DBMF"]
+    all_tickers = ["BOXX", "GDE", "RSSB", "DBMF"]
     
-    # 1. BOXX増分判定 [cite: 2, 7]
-    # 政策金利 - max(他ETF 1ヶ月リターン実績年換算, 3%)
-    other_returns = [indicators.loc[t, "return_1m_annualized"] for t in tickers]
+    # --- 1. BOXX比率の動的調整 (政策金利 vs ETFリターン) ---
+    # 要件: 政策金利 - max(他3銘柄の1ヶ月リターン年換算, 3%)
+    # ※政策金利が3%を超えていても、ETFのリターンがそれを上回っている場合はBOXXは増えません。
+    other_returns = [indicators.loc[t, "return_1m_annualized"] for t in non_boxx_tickers]
     max_other_return = max(max(other_returns), 0.03)
+    
     boxx_diff = policy_rate - max_other_return
     
-    boxx_adjustment = 0
     if boxx_diff > 0:
-        # 正の場合、当該プラス×3ずつBOXX比率を上げる（上限40%） [cite: 7]
-        boxx_adjustment = min(boxx_diff * 3, 0.40 - DEFAULT_RATIOS["BOXX"])
-        ratios["BOXX"] += boxx_adjustment
+        # 増加幅 = 差分 * 3 (上限 40%)
+        boxx_increase = min(boxx_diff * 3, 0.40 - ratios["BOXX"])
+        ratios["BOXX"] += boxx_increase
         
-        # 増分を他のETFから等分に減じる
-        for t in tickers:
-            ratios[t] -= boxx_adjustment / len(tickers)
+        # 増分を他の3銘柄から等分に減じる
+        for t in non_boxx_tickers:
+            ratios[t] -= boxx_increase / len(non_boxx_tickers)
 
-    # 2. 各ETFの配分減算判定 (MAロジック) [cite: 2, 7]
-    adjustments = {t: 0.0 for t in tickers}
-    total_reduction = 0.0
+    # --- 2. BOXX以外の銘柄の配分調整 (MA乖離ロジック) ---
+    reductions = {t: 0.0 for t in non_boxx_tickers}
     
-    for t in tickers:
+    for t in non_boxx_tickers:
+        ma_1m = indicators.loc[t, "ma_1m"]
         ma_3m = indicators.loc[t, "ma_3m"]
         ma_200d = indicators.loc[t, "ma_200d"]
-        ma_1m = indicators.loc[t, "ma_1m"]
         
-        # 3ヶ月MAが200日MAを3%以上下回っているか [cite: 7]
-        ma_ratio = (ma_3m / ma_200d) - 1
+        # 3ヶ月MA / 200日MA の乖離率
+        ma_gap = (ma_3m / ma_200d) - 1
         
-        # 減算除外判定: 1ヶ月MA >= 3ヶ月MA (トレンド回復) [cite: 2, 7]
-        if ma_ratio < -0.03 and not (ma_1m >= ma_3m):
-            # 比率に当該%を乗じて減じる [cite: 7]
-            reduction = ratios[t] * abs(ma_ratio)
-            adjustments[t] = -reduction
-            total_reduction += reduction
+        # 回復判定: 1ヶ月MA >= 3ヶ月MA
+        # 回復している場合は「減算対象から除外（デフォルト比率維持）」
+        is_recovering = ma_1m >= ma_3m
+        
+        if ma_gap < -0.03 and not is_recovering:
+            # 乖離率の絶対値を、その時点の比率に乗じて減算
+            reduction_amt = ratios[t] * abs(ma_gap)
+            reductions[t] = reduction_amt
+            ratios[t] -= reduction_amt
 
-    # 3. 減算分の再配分 (一番好調なETFへ) [cite: 2, 7]
+    # --- 3. 減算分の再配分 (一番好調なETFへ) ---
+    total_reduction = sum(reductions.values())
     if total_reduction > 0:
-        # BOXXを含む全ETFの中で1ヶ月リターンが最大のもの [cite: 7]
-        best_ticker = indicators["return_1m_annualized"].idxmax()
-        ratios[best_ticker] += total_reduction
-        for t in tickers:
-            ratios[t] += adjustments[t]
+        # BOXXを含む全銘柄の中で1ヶ月リターン(年換算)が最大のものへ加算
+        best_ticker = indicators.loc[all_tickers, "return_1m_annualized"].idxmax()
+        
+        # BOXXが最良かつ上限40%に達する場合の考慮
+        if best_ticker == "BOXX" and (ratios["BOXX"] + total_reduction) > 0.40:
+            allowed = max(0, 0.40 - ratios["BOXX"])
+            ratios["BOXX"] += allowed
+            remaining = total_reduction - allowed
+            if remaining > 0:
+                # 残りは次に好調な銘柄（BOXX以外）へ
+                second_best = indicators.loc[non_boxx_tickers, "return_1m_annualized"].idxmax()
+                ratios[second_best] += remaining
+        else:
+            ratios[best_ticker] += total_reduction
 
     return ratios
 
 def check_rebalance_trigger(current_holdings, current_prices, target_ratios):
     """
-    乖離度(2σ)に基づくリバランス要否判定 [cite: 3, 7]
+    動調整後のターゲット比率に基づき、乖離度(2σ相当)を判定する。
     """
-    total_value = sum(current_holdings[t] * current_prices[t] for t in current_holdings)
-    actual_ratios = {t: (current_holdings[t] * current_prices[t]) / total_value for t in current_holdings}
+    total_value = sum(current_holdings[t] * current_prices[t] for t in target_ratios)
+    if total_value == 0:
+        return False, {t: 0.0 for t in target_ratios}, {t: 0.0 for t in target_ratios}
+        
+    actual_ratios = {t: (current_holdings[t] * current_prices[t]) / total_value for t in target_ratios}
     
-    # 乖離率の計算
+    # ターゲット比率からの乖離を計算
     deviations = {t: actual_ratios[t] - target_ratios[t] for t in target_ratios}
     
-    # ここでは簡易的に各銘柄の乖離絶対値の合計や特定閾値(2σ相当の仮定)で判定
-    # 要件に基づき「2σ超過」をリバランス推奨とする [cite: 3]
-    is_required = any(abs(dev) > 0.05 for dev in deviations.values()) # 5%を仮の2σ閾値とする
+    # 乖離判定の閾値 (2σ相当として5%を採用)
+    THRESHOLD = 0.05
+    is_required = any(abs(dev) > THRESHOLD for dev in deviations.values())
     
     return is_required, actual_ratios, deviations
 
 def calculate_trade_shares(total_value, target_ratios, current_prices, current_holdings):
     """
-    売買株式数の算出 [cite: 5]
+    リバランス実行のための売買株式数を算出する。
     """
     actions = []
     for t in target_ratios:
