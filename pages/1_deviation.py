@@ -2,25 +2,37 @@ import streamlit as st
 import sys
 import os
 
-# --- パスの追加 (ImportError対策) ---
-# プロジェクトのルートディレクトリを検索パスに追加します
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
+# --- 【最重要】Streamlit Cloud用 パス強制追加ロジック ---
+# 実行ファイルからの相対パスではなく、OS上の絶対パスでプロジェクトルートを特定します
+current_script_path = os.path.abspath(__file__) # pages/1_deviation.py
+project_root = os.path.dirname(os.path.dirname(current_script_path)) # プロジェクトルート
+
+# sys.pathの先頭に追加し、srcフォルダを確実に見つけられるようにします
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from utils.helpers import sync_params_to_url
-from src.data_loader import get_etf_data, get_risk_free_rate, calculate_technical_indicators
-from src.rebalance_logic import (
-    calculate_dynamic_ratios, 
-    check_rebalance_trigger, 
-    calculate_trade_shares,
-    get_virtual_current_holdings
-)
-from src.visualizer import (
-    plot_price_with_ma, show_metrics, plot_ratio_comparison, 
-    show_logic_summary, show_rebalance_status, show_action_table
-)
+# カレントディレクトリもルートに移動（念のため）
+os.chdir(project_root)
+
+# インポート前に、パスが正しく通っているか確認（エラーの切り分け用）
+try:
+    from utils.helpers import sync_params_to_url
+    from src.data_loader import get_etf_data, get_risk_free_rate, calculate_technical_indicators
+    from src.rebalance_logic import (
+        calculate_dynamic_ratios, 
+        check_rebalance_trigger, 
+        calculate_trade_shares,
+        get_virtual_current_holdings
+    )
+    from src.visualizer import (
+        plot_price_with_ma, show_metrics, plot_ratio_comparison, 
+        show_logic_summary, show_rebalance_status, show_action_table
+    )
+except ImportError as e:
+    st.error(f"インポートエラーが発生しました。パス設定を確認してください: {e}")
+    st.info(f"現在のPython検索パス: {sys.path}")
+    st.stop()
+
 
 st.title("🔍 乖離度リバランス判定 (Daily Check)")
 
