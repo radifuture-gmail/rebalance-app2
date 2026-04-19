@@ -1,3 +1,4 @@
+# v1.0.1 - Forced sync update
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -57,26 +58,29 @@ def calculate_dynamic_ratios(indicators, policy_rate):
 
 def get_virtual_current_holdings(df_prices, policy_rate, initial_capital=100000):
     """
-    【修正】現在の最新データに基づき、設定された総額(initial_capital)を
-    ターゲット比率通りに保有している場合の『現在の株数』を逆算する。
+    設定された総額(initial_capital)をターゲット比率通りに保有している場合の『現在の株数』を逆算する。
     """
     if df_prices.empty:
         return {t: 0.0 for t in BASE_RATIOS.keys()}
 
-    # 1. 最新のインジケーターを計算して、現在の「動的ターゲット比率」を算出
-    from src.data_loader import calculate_technical_indicators
+    # 循環インポートを防ぐために内部でインポート
+    try:
+        from src.data_loader import calculate_technical_indicators
+    except ImportError:
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from src.data_loader import calculate_technical_indicators
+
     indicators = calculate_technical_indicators(df_prices)
     
     if indicators.empty:
-        # インジケーター計算不能な場合は基本比率を使用
         target_ratios = BASE_RATIOS.copy()
         current_prices = df_prices.iloc[-1]
     else:
         target_ratios = calculate_dynamic_ratios(indicators, policy_rate)
         current_prices = indicators["current_price"].to_dict()
 
-    # 2. 設定総額をターゲット比率で割り、現在の価格で割って「あるべき株数」を出す
-    # これにより、(株数 * 現在価格) の合計は必ず設定総額と一致する
     holdings = {}
     for t, ratio in target_ratios.items():
         price = current_prices[t]
@@ -92,7 +96,6 @@ def check_rebalance_trigger(current_holdings, current_prices, target_ratios):
     actual_ratios = {t: (current_holdings[t] * current_prices[t]) / total_value for t in target_ratios}
     deviations = {t: actual_ratios[t] - target_ratios[t] for t in target_ratios}
     
-    # 乖離度判定の閾値 5%
     is_required = any(abs(dev) > 0.05 for dev in deviations.values())
     return is_required, actual_ratios, deviations
 
